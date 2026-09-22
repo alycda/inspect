@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use git2::{ObjectType, Repository, Tree};
 use sem_core::git::bridge::GitBridge;
@@ -703,21 +704,53 @@ fn list_source_files(repo_path: &Path) -> Result<Vec<String>, AnalyzeError> {
     Ok(files)
 }
 
+/// Every extension **any** sem-core plugin claims, read once from the parser
+/// registry rather than hand-listed here.
+///
+/// This is the literal reading of "derive supported extensions from Sem's
+/// registry": the whole registry, all 106 extensions, including the
+/// json/yaml/toml/csv/markdown/latex plugins alongside the tree-sitter code
+/// plugin. `FallbackParserPlugin` registers no extensions (`extensions()`
+/// returns `&[]`), so the map is exactly what sem routes to a real plugin.
+///
+/// What it fixes: the list it replaces named 13 extensions, so Dart, Swift,
+/// Kotlin, Elixir, Bash, Lua and the rest never entered the dependency graph
+/// even though sem parses them. Their changed entities were still triaged,
+/// which is what made the gap quiet - `chunk` entities scored by line count
+/// and a `blast_radius` of 0 that reads as "safe" rather than "not measured".
+///
+/// What it costs, and why the sibling branch narrows to the code plugin:
+/// `compute_risk_score` normalizes blast radius by total graph entity count
+/// (`risk.rs`), so documentation and dependency metadata in the graph deflate
+/// every score in the report. Two of the three call sites also skip
+/// `is_noise_file`, so lockfiles are materialized and parsed. Measured, same
+/// change, one 670 KB `package-lock.json`: High -> Medium, 11 ms -> 738 ms.
+fn source_extensions() -> &'static HashSet<String> {
+    static EXTENSIONS: OnceLock<HashSet<String>> = OnceLock::new();
+    EXTENSIONS.get_or_init(|| {
+        create_default_registry()
+            .registered_extensions()
+            .into_iter()
+            .map(|ext| ext.to_ascii_lowercase())
+            .collect()
+    })
+}
+
 fn is_source_file(path: &str) -> bool {
-    let path = path.to_lowercase();
-    path.ends_with(".rs")
-        || path.ends_with(".ts")
-        || path.ends_with(".tsx")
-        || path.ends_with(".js")
-        || path.ends_with(".jsx")
-        || path.ends_with(".py")
-        || path.ends_with(".go")
-        || path.ends_with(".java")
-        || path.ends_with(".c")
-        || path.ends_with(".cpp")
-        || path.ends_with(".rb")
-        || path.ends_with(".cs")
-        || path.ends_with(".php")
+    // `Path::file_name` rather than splitting on '/': CI runs Windows
+    // (.github/workflows/test-windows.yml).
+    let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    // Every dotted suffix, not just the last: unlike the code plugin alone,
+    // the full registry holds multi-part keys (`.svelte.js`,
+    // `.svelte.spec.ts`), so final-dot matching would diverge from how sem
+    // itself looks a file up.
+    let lower = name.to_ascii_lowercase();
+    let extensions = source_extensions();
+    lower
+        .match_indices('.')
+        .any(|(i, _)| extensions.contains(&lower[i..]))
 }
 
 fn empty_result() -> ReviewResult {
@@ -1340,5 +1373,116 @@ mod tests {
         assert_eq!(result.entity_reviews.len(), 2);
         assert_eq!(result.groups.len(), 2);
         assert!(result.dependency_edges.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod source_file_selection {
+    use super::{is_source_file, source_extensions};
+
+    /// The thirteen the hand-written allowlist named. None may regress.
+    const PREVIOUSLY_ALLOWED: &[&str] = &[
+        "a.rs", "a.ts", "a.tsx", "a.js", "a.jsx", "a.py", "a.go", "a.java", "a.c", "a.cpp", "a.rb",
+        "a.cs", "a.php",
+    ];
+
+    /// Languages sem parses that the hand-written list dropped. Each used to
+    /// reach the fallback parser and come back as 20-line chunks.
+    const PREVIOUSLY_DROPPED: &[&str] = &["a.dart", "a.swift", "a.kt", "a.ex", "a.sh", "a.lua"];
+
+    #[test]
+    fn keeps_every_extension_the_hand_written_list_had() {
+        for path in PREVIOUSLY_ALLOWED {
+            assert!(is_source_file(path), "{path} regressed out of the set");
+        }
+    }
+
+    #[test]
+    fn picks_up_languages_the_hand_written_list_dropped() {
+        for path in PREVIOUSLY_DROPPED {
+            assert!(
+                is_source_file(path),
+                "{path}: sem parses this, so it must reach the graph"
+            );
+        }
+    }
+
+    /// The defining consequence of deriving from the whole registry, asserted
+    /// rather than left implicit: documentation, data and dependency metadata
+    /// are materialized into the dependency graph.
+    ///
+    /// This is a real cost, not a curiosity. `compute_risk_score` divides
+    /// blast radius by the total graph entity count, so each of these shrinks
+    /// every score in the report; and two of the three call sites never apply
+    /// `is_noise_file`, so lockfiles are written out and parsed. Measured on
+    /// one 670 KB `package-lock.json`: a function moved High -> Medium and the
+    /// graph build 11 ms -> 738 ms. The sibling branch narrows to
+    /// `CodeParserPlugin::extensions()` to avoid exactly this.
+    #[test]
+    fn admits_data_docs_and_lockfiles() {
+        for path in [
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "README.md",
+            "Cargo.toml",
+            "data.csv",
+            "config.yaml",
+        ] {
+            assert!(
+                is_source_file(path),
+                "{path}: the registry claims this, so this variant materializes it"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_files_no_plugin_claims() {
+        for path in [
+            "justfile",
+            "Makefile",
+            "Cargo.lock",
+            "a.unknownext",
+            "gradle.properties",
+        ] {
+            assert!(!is_source_file(path), "{path} should not be materialized");
+        }
+    }
+
+    /// Why `is_source_file` scans every dotted suffix rather than the last
+    /// one: unlike the code plugin alone, the full registry holds multi-part
+    /// keys. Note this does not by itself exercise the scan - each of these
+    /// also ends in a separately-registered suffix today - so it pins the
+    /// registry's shape, not the matcher's behaviour.
+    #[test]
+    fn registry_holds_multi_part_keys() {
+        let derived = source_extensions();
+        let multi: Vec<_> = derived.iter().filter(|e| e[1..].contains('.')).collect();
+        assert!(
+            !multi.is_empty(),
+            "expected multi-part registry keys such as .svelte.spec.ts"
+        );
+        assert!(is_source_file("Counter.svelte.spec.ts"));
+    }
+
+    #[test]
+    fn handles_paths_without_an_extension() {
+        for path in ["deploy", "src/deploy", ".gitignore", ""] {
+            assert!(!is_source_file(path), "{path:?} has no claimed extension");
+        }
+    }
+
+    #[test]
+    fn is_derived_from_the_registry_not_hand_listed() {
+        let derived = source_extensions();
+        assert!(
+            derived.len() > PREVIOUSLY_ALLOWED.len() * 4,
+            "expected the registry to claim many more than the 13 hand-listed, got {}",
+            derived.len()
+        );
+    }
+
+    #[test]
+    fn is_case_insensitive() {
+        assert!(is_source_file("SRC/Main.DART"));
     }
 }
