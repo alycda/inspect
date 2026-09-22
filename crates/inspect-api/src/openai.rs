@@ -299,7 +299,7 @@ fn extract_diff_files(diff: &str) -> std::collections::HashSet<String> {
 const CODE_EXTENSIONS: &[&str] = &[
     ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".rb",
     ".c", ".cpp", ".cs", ".swift", ".kt", ".scala", ".hbs", ".erb",
-    ".ex", ".exs", ".hcl",
+    ".ex", ".exs", ".hcl", ".dart",
 ];
 
 /// Drop findings that reference code files not present in the diff.

@@ -310,7 +310,7 @@ Risk levels: **Critical** (>= 0.7), **High** (>= 0.5), **Medium** (>= 0.3), **Lo
 
 ## Languages
 
-TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#, PHP, Swift, Kotlin, Elixir, Bash, HCL/Terraform, Fortran, Vue
+TypeScript, TSX, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, C#, PHP, Swift, Kotlin, Dart, Scala, Elixir, OCaml, Zig, Perl, Bash, HCL/Terraform, Fortran, Vue
 
 Powered by tree-sitter parsers from [sem-core](https://github.com/Ataraxy-Labs/sem).
 

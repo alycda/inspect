@@ -7,6 +7,7 @@ use sem_core::git::types::{DiffScope, FileChange, FileStatus};
 use sem_core::model::change::ChangeType;
 use sem_core::parser::differ::compute_semantic_diff;
 use sem_core::parser::graph::EntityGraph;
+use sem_core::parser::plugins::code::languages::get_all_code_extensions;
 use sem_core::parser::plugins::create_default_registry;
 use tempfile::TempDir;
 
@@ -703,21 +704,17 @@ fn list_source_files(repo_path: &Path) -> Result<Vec<String>, AnalyzeError> {
     Ok(files)
 }
 
+/// Whether a file should be parsed into the entity graph.
+///
+/// Derived from sem-core's language table so that every language its code
+/// plugin can parse (Dart, Swift, Kotlin, ...) also contributes graph nodes.
+/// A file that is diffed but absent from the graph gets zero line numbers,
+/// no dependents, and no blast radius, so this must not drift from sem-core.
 fn is_source_file(path: &str) -> bool {
     let path = path.to_lowercase();
-    path.ends_with(".rs")
-        || path.ends_with(".ts")
-        || path.ends_with(".tsx")
-        || path.ends_with(".js")
-        || path.ends_with(".jsx")
-        || path.ends_with(".py")
-        || path.ends_with(".go")
-        || path.ends_with(".java")
-        || path.ends_with(".c")
-        || path.ends_with(".cpp")
-        || path.ends_with(".rb")
-        || path.ends_with(".cs")
-        || path.ends_with(".php")
+    get_all_code_extensions()
+        .iter()
+        .any(|ext| path.ends_with(ext))
 }
 
 fn empty_result() -> ReviewResult {
@@ -920,6 +917,95 @@ mod tests {
             .expect("caller should be reviewed");
         assert!(caller.start_line > 0);
         assert!(caller.dependency_count > 0);
+    }
+
+    #[test]
+    fn is_source_file_matches_every_sem_core_code_extension() {
+        for ext in get_all_code_extensions() {
+            assert!(
+                is_source_file(&format!("src/file{ext}")),
+                "{ext} is parsed by sem-core but excluded from the graph"
+            );
+            assert!(is_source_file(&format!("SRC/FILE{}", ext.to_uppercase())));
+        }
+        assert!(is_source_file("lib/main.dart"));
+        assert!(!is_source_file("README.md"));
+        assert!(!is_source_file("Cargo.lock"));
+    }
+
+    /// Regression test for Dart support: `.dart` files must be parsed into
+    /// entities (not 20-line fallback chunks) and must be part of the entity
+    /// graph so changed entities get real line numbers.
+    #[test]
+    fn analyze_dart_entities_are_in_graph() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+
+        std::fs::write(dir.join("README.md"), "init\n").unwrap();
+        commit(dir, "init");
+
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(
+            dir.join("lib/counter.dart"),
+            concat!(
+                "class Counter {\n",
+                "  int _count = 0;\n",
+                "\n",
+                "  void increment() {\n",
+                "    _count += 1;\n",
+                "  }\n",
+                "}\n",
+                "\n",
+                "int add(int a, int b) {\n",
+                "  return a + b;\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        commit(dir, "add counter");
+
+        let result = analyze(
+            dir,
+            DiffScope::Commit {
+                sha: "HEAD".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            result.timing.file_count > 0,
+            "dart file should be listed for the graph"
+        );
+        assert!(result.timing.graph_entity_count > 0);
+        assert!(
+            result
+                .entity_reviews
+                .iter()
+                .all(|r| r.entity_type != "chunk"),
+            "dart entities must come from the tree-sitter parser, not the fallback chunker"
+        );
+
+        let increment = result
+            .entity_reviews
+            .iter()
+            .find(|r| r.entity_name == "increment")
+            .expect("increment should be reviewed");
+        assert_eq!(increment.entity_type, "method");
+        assert_eq!(increment.file_path, "lib/counter.dart");
+        assert!(
+            increment.start_line > 0,
+            "graph metadata missing for dart entity"
+        );
+        assert!(increment.end_line >= increment.start_line);
+
+        let add = result
+            .entity_reviews
+            .iter()
+            .find(|r| r.entity_name == "add")
+            .expect("add should be reviewed");
+        assert_eq!(add.entity_type, "function");
+        assert!(add.start_line > 0);
     }
 
     #[test]
